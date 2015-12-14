@@ -29,6 +29,7 @@ namespace Template10.MSBUILD
 
         private string tempFolder;
         private ItemFolder topFolder;
+        bool helpFileReferenceExists = false;
 
         #endregion
 
@@ -99,6 +100,7 @@ namespace Template10.MSBUILD
         [Required]
         public string SourceDir { get; set; }
 
+        public string TargetDir2 { get; set; }
 
         /// <summary>
         /// Gets or sets the target dir.
@@ -117,6 +119,7 @@ namespace Template10.MSBUILD
         /// <returns></returns>
         public override bool Execute()
         {
+            helpFileReferenceExists = false;
             tempFolder = Path.Combine(TargetDir, Constants.TEMPFOLDER);
             if (Directory.Exists(tempFolder))
             {
@@ -125,15 +128,64 @@ namespace Template10.MSBUILD
 
             string projectFolder = Path.GetDirectoryName(CsprojFile);
             CopyProjectFilesToTempFolder(projectFolder, tempFolder);
+            ReplaceNamespace(tempFolder);
             FileHelper.DeleteKey(tempFolder);
             ProcessVSTemplate(tempFolder);
             OperateOnCsProj(tempFolder, CsprojFile);
+            OperateOnManifest(Path.Combine(tempFolder, "Package.appxmanifest"));
             CopyEmbeddedFilesToOutput(tempFolder);
             string jsonProj = Path.Combine(tempFolder, Constants.PROJECTJSON);
             AddTemplate10Nuget(jsonProj);
             SetupHelpFile(Path.Combine(tempFolder, Constants.HELPHTML), HelpUrl);
             ZipFiles(tempFolder, ZipName, TargetDir);
             return true;
+        }
+
+        /// <summary>
+        /// Replaces the namespace.
+        /// </summary>
+        /// <param name="tempFolder">The temporary folder.</param>
+        private void ReplaceNamespace(string tempFolder)
+        {
+            string csprojXml = FileHelper.ReadFile(CsprojFile);
+            string rootNamespace = GetExistingRootNamespace(csprojXml);
+            var ext = new List<string> { ".cs", ".xaml"};
+            var files = Directory.GetFiles(tempFolder, "*.*", SearchOption.AllDirectories).Where(s => ext.Any(e => s.EndsWith(e)));
+            foreach (var file in files)
+            {
+                string text = FileHelper.ReadFile(file);
+                //TODO: think about a safer way to do this... what if there is another use of RootNamespace string elsewhere... this will break the generated project.
+                text = text.Replace(rootNamespace, "$safeprojectname$");
+                FileHelper.WriteFile(file, text);
+            }
+        }
+
+        /// <summary>
+        /// Operates the on manifest.
+        /// </summary>
+        /// <param name="manifestFile">The manifest file.</param>
+        private void OperateOnManifest(string manifestFile)
+        {
+            string manifestText = FileHelper.ReadFile(manifestFile);
+
+            var replacements = new List<FindReplaceItem>();
+
+            replacements.Add(new FindReplaceItem() { Pattern = "<mp:PhoneIdentity(.*?)/>", Replacement = @"<mp:PhoneIdentity PhoneProductId=""$$guid9$$"" PhonePublisherId=""00000000-0000-0000-0000-000000000000""/>" });
+            replacements.Add(new FindReplaceItem() { Pattern = "<DisplayName>(.*?)</DisplayName>", Replacement = @"<DisplayName>$$projectname$$</DisplayName>" });
+            replacements.Add(new FindReplaceItem() { Pattern = "<PublisherDisplayName>(.*?)</PublisherDisplayName>", Replacement = @"<PublisherDisplayName>$$XmlEscapedPublisher$$</PublisherDisplayName>" });
+            replacements.Add(new FindReplaceItem() { Pattern = @"Executable=""(.*?)""", Replacement = @"Executable=""$$targetnametoken$$.exe""" });
+            replacements.Add(new FindReplaceItem() { Pattern = @"EntryPoint=""(.*?)""", Replacement = @"EntryPoint=""$$safeprojectname$$.App""" });
+            replacements.Add(new FindReplaceItem() { Pattern = @"DisplayName=""(.*?)""", Replacement = @"DisplayName=""$$projectname$$.App""" });
+            replacements.Add(new FindReplaceItem() { Pattern = @"EntryPoint=""(.*?)""", Replacement = @"EntryPoint=""$$projectname$$.App""" });
+
+            foreach (var item in replacements)
+            {
+                manifestText = Regex.Replace(manifestText, item.Pattern, item.Replacement);
+            }
+
+            manifestText = ReplaceIdentityNode(manifestText);
+
+            FileHelper.WriteFile(manifestFile, manifestText);
         }
 
         /// <summary>
@@ -211,12 +263,16 @@ namespace Template10.MSBUILD
         private void ZipFiles(string tempFolder, string zipName, string targetDir)
         {
             string zipFileName = Path.Combine(targetDir, ZipName);
+            string zipFileName2 = Path.Combine(TargetDir2, ZipName);
 
             if (File.Exists(zipFileName))
             {
                 File.Delete(zipFileName);
             }
             ZipFile.CreateFromDirectory(tempFolder, zipFileName);
+
+            //-- now second one...
+            File.Copy(zipFileName, zipFileName2, true);
 
             //-- clean up the temporary folder
             Directory.Delete(tempFolder, true);
@@ -270,16 +326,55 @@ namespace Template10.MSBUILD
 
             foreach (var item in replacements)
             {
-                string pattern = item.Pattern;
-                string replacement = item.Replacement;
-                string input = csprojText;
-                string result = Regex.Replace(input, pattern, replacement);
-                csprojText = result;
+                csprojText  = Regex.Replace(csprojText, item.Pattern, item.Replacement);
             }
 
             csprojText = RemoveItemNodeAround(@"csproj", csprojText);
 
+            csprojText = AddHelpToCSProj(csprojText);
+
             FileHelper.WriteFile(targetPath, csprojText);
+        }
+
+        /// <summary>
+        /// Adds the help to cs proj.
+        /// </summary>
+        /// <param name="csprojText">The csproj text.</param>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        private string AddHelpToCSProj(string csprojText)
+        {
+            //<Content Include="Help.htm" />
+            //    <Content Include="Properties\Default.rd.xml" />
+
+            if (csprojText.ToLower().Contains("help.htm"))
+            {
+                return csprojText;
+            }
+
+            string findText = @"<Content Include=""Properties\Default.rd.xml"" />";
+            string helpText = @"<Content Include=""Help.htm"" />";
+
+            csprojText = csprojText.Replace(findText, helpText + findText);
+            return csprojText;
+        }
+
+        /// <summary>
+        /// Gets the existing root namespace.
+        /// </summary>
+        /// <param name="csprojxml">The csprojxml.</param>
+        /// <returns></returns>
+        private string GetExistingRootNamespace(string csprojxml)
+        {
+            XDocument xdoc;
+            using (StringReader sr = new StringReader(csprojxml))
+            {
+                xdoc = XDocument.Load(sr, LoadOptions.None);
+            }
+
+            XNamespace ns = "http://schemas.microsoft.com/developer/msbuild/2003";
+            return xdoc.Descendants(ns + "RootNamespace").FirstOrDefault().Value;
+
         }
 
         /// <summary>
@@ -306,6 +401,38 @@ namespace Template10.MSBUILD
             lastHalf = csprojText.Substring(end + 12);
             return firstHalf + lastHalf;
         }
+
+        /// <summary>
+        /// Replaces the identity node.
+        /// </summary>
+        /// <param name="manifestText">The manifest text.</param>
+        /// <returns></returns>
+        private string ReplaceIdentityNode(string manifestText)
+        {
+            string findText = @"<Identity";
+            if (!manifestText.Contains(findText))
+            {
+                return manifestText;
+            }
+
+            string identityReplacementText = @"<Identity
+    Name=""$guid9$""
+    Publisher = ""$XmlEscapedPublisherDistinguishedName$""
+    Version = ""1.0.0.0"" /> ";
+
+            int findTextIndex, start, end;
+            string firstHalf, lastHalf;
+
+            findTextIndex = manifestText.IndexOf(findText);
+
+            start = findTextIndex;
+            end = manifestText.IndexOf("/>", findTextIndex);
+            firstHalf = manifestText.Substring(0, start);
+            lastHalf = manifestText.Substring(end + 2);
+            return firstHalf + identityReplacementText + lastHalf;
+        }
+
+
         /// <summary>
         /// Gets the project node.
         /// </summary>
@@ -316,13 +443,17 @@ namespace Template10.MSBUILD
         {
             string projectNodeStart = @"<Project TargetFileName=""$projectName"" File=""$projectName"" ReplaceParameters=""true"">";
             projectNodeStart = projectNodeStart.Replace("$projectName", projectFileName);
-            string projectName = GetProjectName(csprojxml);
+            //string projectName = GetProjectName(csprojxml);
             List<string> projectItems = GetProjectItems(csprojxml);
 
             //-- sorting for directories
             projectItems = SortProjectItems(projectItems);
             GetItemFolder(projectItems);
             string foldersString = SerializeFolder(topFolder);
+            if (!helpFileReferenceExists)
+            {
+                foldersString = InsertHelp(foldersString);
+            }
 
             using (StringWriter writer = new StringWriter())
             {
@@ -333,6 +464,17 @@ namespace Template10.MSBUILD
                 return writer.ToString();
             }
 
+        }
+
+        /// <summary>
+        /// Inserts the help.
+        /// </summary>
+        /// <param name="foldersString">The folders string.</param>
+        /// <returns></returns>
+        private string InsertHelp(string foldersString)
+        {
+            string helpString = @"<ProjectItem ReplaceParameters=""false"" TargetFileName=""help.htm"" OpenInWebBrowser=""true"">help.htm</ProjectItem>";
+            return helpString + foldersString;
         }
 
         /// <summary>
@@ -353,7 +495,12 @@ namespace Template10.MSBUILD
 
             foreach (var item in topFolder.Items)
             {
-                if (IsKeyProjectItemNode(item))
+                if (IsHelpItem(item))
+                { 
+                    folderString = folderString + @"<ProjectItem ReplaceParameters=""false"" TargetFileName=""help.htm"" OpenInWebBrowser=""true"">help.htm</ProjectItem>";
+                    helpFileReferenceExists = true;
+                }
+                else if (IsKeyProjectItemNode(item))
                     folderString = folderString + @"<ProjectItem ReplaceParameters=""false"" TargetFileName=""$projectname$_TemporaryKey.pfx"" BlendDoNotCreate=""true"">Application_TemporaryKey.pfx</ProjectItem>";
                 else
                 {
@@ -377,6 +524,16 @@ namespace Template10.MSBUILD
 
             return folderString;
 
+        }
+
+        /// <summary>
+        /// Determines whether [is help item] [the specified item].
+        /// </summary>
+        /// <param name="item">The item.</param>
+        /// <returns></returns>
+        private bool IsHelpItem(string item)
+        {
+            return item.ToLower().Contains("help.htm");
         }
 
         /// <summary>
@@ -523,15 +680,6 @@ namespace Template10.MSBUILD
 
         }
 
-        /// <summary>
-        /// Gets the name of the project.
-        /// </summary>
-        /// <param name="csprojxml">The csprojxml.</param>
-        /// <returns></returns>
-        private string GetProjectName(string csprojxml)
-        {
-            return "project";
-        }
 
 
 
